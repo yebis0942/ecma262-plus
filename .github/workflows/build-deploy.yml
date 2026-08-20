@@ -1,0 +1,137 @@
+name: build-deploy
+
+on:
+  schedule:
+    - cron: '17 4 * * *' # daily
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: site
+
+      - uses: actions/checkout@v4
+        with:
+          repository: yebis0942/ecmarkup
+          ref: main
+          path: ecmarkup
+
+      # ECMA262_REF is a repo Actions variable (default main); pin it via
+      # `gh variable set ECMA262_REF --body <sha>` when upstream breaks the build.
+      - uses: actions/checkout@v4
+        with:
+          repository: tc39/ecma262
+          ref: ${{ vars.ECMA262_REF || 'main' }}
+          path: ecma262
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            ecmarkup/package-lock.json
+            ecma262/package-lock.json
+
+      - name: Record build provenance
+        run: |
+          echo "SPEC_REV=$(git -C ecma262 rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "EMU_REV=$(git -C ecmarkup rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Build ecmarkup
+        run: |
+          cd ecmarkup
+          npm ci
+          npm run build
+
+      # Local-path install after `npm ci` (which would wipe a pre-existing
+      # symlink): symlinks the ecmarkup we just built, deterministically,
+      # without triggering its prepack the way a git-URL dependency would.
+      - name: Wire ecma262 to the ecmarkup fork
+        run: |
+          cd ecma262
+          npm ci
+          npm install --no-save "$GITHUB_WORKSPACE/ecmarkup"
+          node -e 'console.log("using ecmarkup", require("ecmarkup/package.json").version)'
+
+      # The published editions are immutable, so a warm cache means zero
+      # traffic to 262.ecma-international.org.
+      - name: Cache version-bar edition downloads
+        uses: actions/cache@v4
+        with:
+          path: ecmarkup/.version-cache
+          key: version-bar-${{ hashFiles('ecmarkup/scripts/version-bar-config.json') }}
+          restore-keys: version-bar-
+
+      - name: Generate version-bar data
+        id: vbar
+        continue-on-error: true
+        run: |
+          cd ecmarkup
+          npx tsx scripts/generate-version-bar-data.ts \
+            --spec-html "$GITHUB_WORKSPACE/ecma262/spec.html" \
+            --out-dir "$RUNNER_TEMP/version-bar"
+
+      - name: Decide version-bar flags
+        id: vbarflags
+        run: |
+          if [ -f "$RUNNER_TEMP/version-bar/version-bar-manifest.json" ]; then
+            echo "flags=--version-bar $RUNNER_TEMP/version-bar/version-bar-manifest.json --version-bar-dir /${{ github.event.repository.name }}/assets" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::version-bar data generation failed; building without the version bar"
+            echo "flags=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the spec
+        run: |
+          cd ecma262
+          npm run build-only -- ${{ steps.vbarflags.outputs.flags }}
+
+      # ecmarkup does not copy client-fetched data itself: version-bar data is
+      # user-managed when --version-bar-dir is passed, and the impl-links files
+      # always are (see scripts/impl-links/README.md in the fork).
+      - name: Place widget data files
+        run: |
+          if [ -d "$RUNNER_TEMP/version-bar/version-bar-data" ]; then
+            cp -r "$RUNNER_TEMP/version-bar/version-bar-data" ecma262/out/assets/version-bar-data
+          fi
+          cp ecmarkup/impl-links.json ecmarkup/impl-links-index.json ecma262/out/
+
+      - name: Inject banner, robots, and widget globals
+        run: |
+          node site/scripts/postprocess.mjs ecma262/out \
+            --prefix "/${{ github.event.repository.name }}" \
+            --spec-rev "$SPEC_REV" --emu-rev "$EMU_REV" \
+            --impl-links ecmarkup/impl-links.json
+          printf 'User-agent: *\nDisallow: /\n' > ecma262/out/robots.txt
+          du -sh ecma262/out
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ecma262/out
+
+  # Skipped until the DEPLOY_ENABLED repo variable is set to 'true' and
+  # GitHub Pages is enabled (build_type=workflow); see README.
+  deploy:
+    if: vars.DEPLOY_ENABLED == 'true'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4
+        id: deployment

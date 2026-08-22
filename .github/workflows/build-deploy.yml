@@ -21,11 +21,14 @@ jobs:
         with:
           path: site
 
+      # SITE_TOOLS_REF is a repo Actions variable (default main); pin it via
+      # `gh variable set SITE_TOOLS_REF --body <sha>` to roll the build tooling
+      # back to a known-good commit without touching this repo.
       - uses: actions/checkout@v4
         with:
-          repository: yebis0942/ecmarkup
-          ref: main
-          path: ecmarkup
+          repository: yebis0942/ecma262-site-tools
+          ref: ${{ vars.SITE_TOOLS_REF || 'main' }}
+          path: site-tools
 
       # ECMA262_REF is a repo Actions variable (default main); pin it via
       # `gh variable set ECMA262_REF --body <sha>` when upstream breaks the build.
@@ -39,29 +42,21 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: |
-            ecmarkup/package-lock.json
-            ecma262/package-lock.json
+          cache-dependency-path: site-tools/package-lock.json
 
       - name: Record build provenance
         run: |
           echo "SPEC_REV=$(git -C ecma262 rev-parse HEAD)" >> "$GITHUB_ENV"
-          echo "EMU_REV=$(git -C ecmarkup rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "TOOLS_REV=$(git -C site-tools rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      - name: Build ecmarkup
+      # site-tools pins ecmarkup as an npm dependency, so there is nothing to
+      # build from source. ecma262 needs no install at all: the build wrapper
+      # reads spec.html directly (emu-import is resolved at build time).
+      # Dev dependencies are required — the data generator runs under tsx.
+      - name: Install the build wrapper
         run: |
-          cd ecmarkup
+          cd site-tools
           npm ci
-          npm run build
-
-      # Local-path install after `npm ci` (which would wipe a pre-existing
-      # symlink): symlinks the ecmarkup we just built, deterministically,
-      # without triggering its prepack the way a git-URL dependency would.
-      - name: Wire ecma262 to the ecmarkup fork
-        run: |
-          cd ecma262
-          npm ci
-          npm install --no-save "$GITHUB_WORKSPACE/ecmarkup"
           node -e 'console.log("using ecmarkup", require("ecmarkup/package.json").version)'
 
       # The published editions are immutable, so a warm cache means zero
@@ -69,59 +64,62 @@ jobs:
       - name: Cache version-bar edition downloads
         uses: actions/cache@v4
         with:
-          path: ecmarkup/.version-cache
-          key: version-bar-${{ hashFiles('ecmarkup/scripts/version-bar-config.json') }}
-          restore-keys: version-bar-
+          path: site-tools/.version-cache
+          key: version-bar-v2-${{ hashFiles('site-tools/scripts/version-bar-config.json') }}
+          restore-keys: version-bar-v2-
 
       - name: Generate version-bar data
         id: vbar
         continue-on-error: true
         run: |
-          cd ecmarkup
-          npx tsx scripts/generate-version-bar-data.ts \
+          cd site-tools
+          npm run generate-version-bar-data -- \
             --spec-html "$GITHUB_WORKSPACE/ecma262/spec.html" \
             --out-dir "$RUNNER_TEMP/version-bar"
 
       - name: Decide version-bar flags
         id: vbarflags
         run: |
-          if [ -f "$RUNNER_TEMP/version-bar/version-bar-manifest.json" ]; then
-            echo "flags=--version-bar $RUNNER_TEMP/version-bar/version-bar-manifest.json --version-bar-dir /${{ github.event.repository.name }}/assets" >> "$GITHUB_OUTPUT"
+          manifest="$RUNNER_TEMP/version-bar/version-bar-manifest.json"
+          # The manifest is written last, so a half-finished run leaves none.
+          # Check the schema too: ecma262-build throws on anything but v2, which
+          # would fail the whole build rather than degrade.
+          if node -e 'const m = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+                      process.exit(m.schemaVersion === 2 && Object.keys(m.sections).length > 0 ? 0 : 1);' \
+                   "$manifest" 2>/dev/null; then
+            echo "flags=--version-bar $manifest" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::version-bar data generation failed; building without the version bar"
+            echo "::warning::version-bar data unusable (generate step: ${{ steps.vbar.outcome }}); building without the version bar"
             echo "flags=" >> "$GITHUB_OUTPUT"
           fi
 
+      # ecma262-build injects the widgets with per-page relative paths (so the
+      # site works under the /ecma262-plus/ prefix and on multipage subpages)
+      # and copies the widget data (version-bar-data/, impl-links.json) into
+      # the output itself. img/ is ecma262's own resource, which ecmarkup does
+      # not handle — the official build copies it with `cp -R img out`.
       - name: Build the spec
         run: |
-          cd ecma262
-          npm run build-only -- ${{ steps.vbarflags.outputs.flags }}
+          cd site-tools
+          npx ecma262-build "$GITHUB_WORKSPACE/ecma262/spec.html" "$GITHUB_WORKSPACE/out" \
+            --multipage --verbose \
+            --copy "$GITHUB_WORKSPACE/ecma262/img" \
+            ${{ steps.vbarflags.outputs.flags }}
 
-      # ecmarkup does not copy client-fetched data itself: version-bar data is
-      # user-managed when --version-bar-dir is passed, and the impl-links files
-      # always are (see scripts/impl-links/README.md in the fork).
-      - name: Place widget data files
+      - name: Inject banner and robots
         run: |
-          if [ -d "$RUNNER_TEMP/version-bar/version-bar-data" ]; then
-            cp -r "$RUNNER_TEMP/version-bar/version-bar-data" ecma262/out/assets/version-bar-data
-          fi
-          cp ecmarkup/impl-links.json ecmarkup/impl-links-index.json ecma262/out/
-
-      - name: Inject banner, robots, and widget globals
-        run: |
-          node site/scripts/postprocess.mjs ecma262/out \
-            --prefix "/${{ github.event.repository.name }}" \
-            --spec-rev "$SPEC_REV" --emu-rev "$EMU_REV" \
-            --impl-links ecmarkup/impl-links.json
-          printf 'User-agent: *\nDisallow: /\n' > ecma262/out/robots.txt
-          du -sh ecma262/out
+          node site/scripts/postprocess.mjs out \
+            --spec-rev "$SPEC_REV" --tools-rev "$TOOLS_REV" \
+            --ecmarkup-version "$(node -p "require('./site-tools/package.json').dependencies.ecmarkup")" \
+            --impl-links out/impl-links.json
+          printf 'User-agent: *\nDisallow: /\n' > out/robots.txt
+          du -sh out
 
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: ecma262/out
+          path: out
 
-  # Skipped until the DEPLOY_ENABLED repo variable is set to 'true' and
-  # GitHub Pages is enabled (build_type=workflow); see README.
+  # Skipped unless the DEPLOY_ENABLED repo variable is 'true'; see README.
   deploy:
     if: vars.DEPLOY_ENABLED == 'true'
     needs: build

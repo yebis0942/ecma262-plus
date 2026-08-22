@@ -3,16 +3,17 @@
 // as an UNOFFICIAL site:
 //   - injects an "unofficial build" warning banner (dismissable, Escape works)
 //     with build provenance and impl-links data freshness into every page
-//   - injects `window.implLinksDataUrl` so the impl-links widget resolves its
-//     data from the site root on both index.html and multipage/*.html
 //   - adds <meta name="robots" content="noindex">
 //
-// Usage:
-//   node scripts/postprocess.mjs <outDir> --prefix </repo-name or empty>
-//     [--spec-rev sha] [--emu-rev sha] [--impl-links <impl-links.json>]
+// Widget data URLs are not our business: ecma262-build injects them per page
+// with paths relative to that page.
 //
-// Plain string splicing, no DOM library: the multipage build is ~100MB of
-// HTML and every page needs the same three insertions.
+// Usage:
+//   node scripts/postprocess.mjs <outDir> [--spec-rev sha] [--tools-rev sha]
+//     [--ecmarkup-version x.y.z] [--impl-links <impl-links.json>]
+//
+// Plain string splicing, no DOM library: the multipage build is well over
+// 100MB of HTML and every page needs the same two insertions.
 
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -20,9 +21,9 @@ import { parseArgs } from 'node:util';
 
 const { values: args, positionals } = parseArgs({
   options: {
-    prefix: { type: 'string', default: '' },
     'spec-rev': { type: 'string', default: '' },
-    'emu-rev': { type: 'string', default: '' },
+    'tools-rev': { type: 'string', default: '' },
+    'ecmarkup-version': { type: 'string', default: '' },
     'impl-links': { type: 'string', default: '' },
   },
   allowPositionals: true,
@@ -30,13 +31,12 @@ const { values: args, positionals } = parseArgs({
 
 const outDir = positionals[0];
 if (!outDir) {
-  console.error('Usage: postprocess.mjs <outDir> [--prefix /repo] [--spec-rev sha] …');
+  console.error('Usage: postprocess.mjs <outDir> [--spec-rev sha] [--tools-rev sha] …');
   process.exit(2);
 }
-// URL path prefix under which the site is served ('' when served at the root).
-const prefix = (args.prefix ?? '').replace(/\/$/, '');
 const specRev = args['spec-rev'];
-const emuRev = args['emu-rev'];
+const toolsRev = args['tools-rev'];
+const ecmarkupVersion = args['ecmarkup-version'];
 const buildDate = new Date().toISOString().slice(0, 10);
 
 let implLinksMeta = null;
@@ -80,7 +80,9 @@ const BANNER_HTML = `
   </p>
   <p>
     Built ${buildDate} from tc39/ecma262 ${revLink('tc39/ecma262', specRev)}
-    with ecmarkup fork ${revLink('yebis0942/ecmarkup', emuRev)}.
+    with ${revLink('yebis0942/ecma262-site-tools', toolsRev)}${
+      ecmarkupVersion ? ` (ecmarkup ${escapeHtml(ecmarkupVersion)})` : ''
+    }.
     ${freshness}
   </p>
 </details>
@@ -164,9 +166,7 @@ details.annoying-warning a {
 `;
 
 const HEAD_INSERT =
-  `<meta name="robots" content="noindex">` +
-  `<script>window.implLinksDataUrl = ${JSON.stringify(prefix + '/impl-links.json')};</script>` +
-  `<style>${BANNER_CSS}</style>`;
+  `<meta name="robots" content="noindex">` + `<style>${BANNER_CSS}</style>`;
 
 function processFile(file) {
   let html = readFileSync(file, 'utf8');
@@ -200,4 +200,4 @@ try {
 }
 
 for (const file of files) processFile(file);
-console.log(`postprocessed ${files.length} pages (prefix: ${JSON.stringify(prefix)})`);
+console.log(`postprocessed ${files.length} pages`);
